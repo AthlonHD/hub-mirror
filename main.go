@@ -7,6 +7,7 @@ import (
 	"os"
 	"sync"
 	"text/template"
+	"time"
 
 	"github.com/spf13/pflag"
 	"github.com/togettoyou/hub-mirror/pkg"
@@ -29,31 +30,28 @@ func main() {
 		Content  []string `json:"hub-mirror"`
 		Platform string   `json:"platform"`
 	}
-
-	err := json.Unmarshal([]byte(*content), &hubMirrors)
-	if err != nil {
+	if err := json.Unmarshal([]byte(*content), &hubMirrors); err != nil {
 		panic(err)
 	}
-
 	if len(hubMirrors.Content) > *maxContent {
 		panic("提交的原始镜像个数超出了最大限制")
 	}
-
 	fmt.Printf("mirrors: %+v, platform: %+v\n", hubMirrors.Content, hubMirrors.Platform)
 
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
+	defer cancel()
+
 	fmt.Println("初始化 Docker 客户端")
-	cli, err := pkg.NewCli(context.Background(), *repository, *username, *password, os.Stdout)
+	cli, err := pkg.NewCli(ctx, *repository, *username, *password, os.Stdout)
 	if err != nil {
 		panic(err)
 	}
 
 	outputs := make([]*pkg.Output, 0)
-	mu := sync.Mutex{}
-	wg := sync.WaitGroup{}
-
+	var mu sync.Mutex
+	var wg sync.WaitGroup
 	for _, source := range hubMirrors.Content {
 		source := source
-
 		if source == "" {
 			continue
 		}
@@ -61,21 +59,20 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-
-			output, err := cli.PullTagPushImage(context.Background(), source, hubMirrors.Platform)
+			output, err := cli.PullTagPushImage(ctx, source, hubMirrors.Platform)
 			if err != nil {
 				fmt.Println(source, "转换异常: ", err)
 				return
 			}
-
 			mu.Lock()
-			defer mu.Unlock()
 			outputs = append(outputs, output)
+			mu.Unlock()
 		}()
 	}
-
 	wg.Wait()
-
+	if err := ctx.Err(); err != nil {
+		panic(err)
+	}
 	if len(outputs) == 0 {
 		panic("没有转换成功的镜像")
 	}
@@ -89,12 +86,10 @@ func main() {
 		panic(err)
 	}
 	defer outputFile.Close()
-
-	err = tmpl.Execute(outputFile, map[string]interface{}{
-		"Outputs":    outputs,
+	if err := tmpl.Execute(outputFile, map[string]interface{}{
+		"Outputs": outputs,
 		"Repository": *repository,
-	})
-	if err != nil {
+	}); err != nil {
 		panic(err)
 	}
 }
