@@ -44,8 +44,13 @@ func NewCli(ctx context.Context, repository, username, password string, log io.W
 	if err != nil {
 		return nil, err
 	}
-	_, err = cli.RegistryLogin(ctx, authConfig)
+
+	err = retryWithTimeout(ctx, registryLoginTimeout, retryAttempts, retryInitialDelay, func(attemptCtx context.Context) error {
+		_, loginErr := cli.RegistryLogin(attemptCtx, authConfig)
+		return loginErr
+	})
 	if err != nil {
+		_ = cli.Close()
 		return nil, err
 	}
 
@@ -96,10 +101,7 @@ func (c *Cli) Source2Target(source string, platform string) (*Output, error) {
 		target = c.repository + "/" + strings.ReplaceAll(target, "/", ".")
 	}
 
-	return &Output{
-		Source: source,
-		Target: target,
-	}, nil
+	return &Output{Source: source, Target: target}, nil
 }
 
 func (c *Cli) PullTagPushImage(ctx context.Context, source, platform string) (*Output, error) {
@@ -108,21 +110,15 @@ func (c *Cli) PullTagPushImage(ctx context.Context, source, platform string) (*O
 		return nil, err
 	}
 
-	err = c.PullImage(ctx, output.Source, platform)
-	if err != nil {
+	if err := c.PullImage(ctx, output.Source, platform); err != nil {
 		return nil, err
 	}
-
-	err = c.cli.ImageTag(ctx, output.Source, output.Target)
-	if err != nil {
+	if err := c.cli.ImageTag(ctx, output.Source, output.Target); err != nil {
 		return nil, err
 	}
-
-	err = c.PushImage(ctx, output.Target, platform)
-	if err != nil {
+	if err := c.PushImage(ctx, output.Target, platform); err != nil {
 		return nil, err
 	}
-
 	return output, nil
 }
 
@@ -131,74 +127,78 @@ type errorMessage struct {
 }
 
 func (c *Cli) PullImage(ctx context.Context, image, platform string) error {
+	return retryWithTimeout(ctx, imageTransferTimeout, retryAttempts, retryInitialDelay, func(attemptCtx context.Context) error {
+		return c.pullImageOnce(attemptCtx, image, platform)
+	})
+}
+
+func (c *Cli) pullImageOnce(ctx context.Context, image, platform string) error {
 	pullOut, err := c.cli.ImagePull(ctx, image, types.ImagePullOptions{Platform: platform})
-	defer func() {
-		if pullOut != nil {
-			pullOut.Close()
-		}
-	}()
+	if pullOut != nil {
+		defer pullOut.Close()
+	}
 	if err != nil {
 		return err
 	}
 
-	var e errorMessage
-	buffIOReader := bufio.NewReader(pullOut)
+	reader := bufio.NewReader(pullOut)
 	for {
-		streamBytes, err := buffIOReader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
+		streamBytes, readErr := reader.ReadBytes('\n')
+		if len(streamBytes) > 0 {
+			if c.log != nil {
+				_, _ = c.log.Write(streamBytes)
 			}
-			return err
+			var response errorMessage
+			_ = json.Unmarshal(streamBytes, &response)
+			if response.Error != "" {
+				return errors.New(response.Error)
+			}
 		}
-
-		if c.log != nil {
-			_, _ = c.log.Write(streamBytes)
-		}
-
-		_ = json.Unmarshal(streamBytes, &e)
-		if e.Error != "" {
-			return errors.New(e.Error)
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
 		}
 	}
-
-	return nil
 }
 
 func (c *Cli) PushImage(ctx context.Context, image, platform string) error {
+	return retryWithTimeout(ctx, imageTransferTimeout, retryAttempts, retryInitialDelay, func(attemptCtx context.Context) error {
+		return c.pushImageOnce(attemptCtx, image, platform)
+	})
+}
+
+func (c *Cli) pushImageOnce(ctx context.Context, image, platform string) error {
 	pushOut, err := c.cli.ImagePush(ctx, image, types.ImagePushOptions{
 		RegistryAuth: c.auth,
 		Platform:     platform,
 	})
-	defer func() {
-		if pushOut != nil {
-			pushOut.Close()
-		}
-	}()
+	if pushOut != nil {
+		defer pushOut.Close()
+	}
 	if err != nil {
 		return err
 	}
 
-	var e errorMessage
-	buffIOReader := bufio.NewReader(pushOut)
+	reader := bufio.NewReader(pushOut)
 	for {
-		streamBytes, err := buffIOReader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF {
-				break
+		streamBytes, readErr := reader.ReadBytes('\n')
+		if len(streamBytes) > 0 {
+			if c.log != nil {
+				_, _ = c.log.Write(streamBytes)
 			}
-			return err
+			var response errorMessage
+			_ = json.Unmarshal(streamBytes, &response)
+			if response.Error != "" {
+				return errors.New(response.Error)
+			}
 		}
-
-		if c.log != nil {
-			_, _ = c.log.Write(streamBytes)
-		}
-
-		_ = json.Unmarshal(streamBytes, &e)
-		if e.Error != "" {
-			return errors.New(e.Error)
+		if readErr != nil {
+			if readErr == io.EOF {
+				return nil
+			}
+			return readErr
 		}
 	}
-
-	return nil
 }
